@@ -4,7 +4,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.tabletopia.restaurantservice.domain.reservation.entity.Reservation;
 import com.tabletopia.restaurantservice.domain.reservation.exception.ReservationNotFoundException;
+import com.tabletopia.restaurantservice.domain.reservation.exception.UnauthorizedReservationAccessException;
 import com.tabletopia.restaurantservice.domain.reservation.repository.ReservationRepository;
 import com.tabletopia.restaurantservice.domain.reservation.service.ReservationService;
 import com.tabletopia.restaurantservice.domain.reservation.service.TableSelectionService;
@@ -18,6 +20,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.BDDMockito;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
+import org.mockito.configuration.IMockitoConfiguration;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 
@@ -47,12 +50,49 @@ class ReservationServiceTest {
   @Mock
   SimpMessagingTemplate messagingTemplate;
 
+  @Mock
+  Reservation reservation;
+
   // ---------------------------------------------------------------------- //
   /**
-   * 예약 데이터가 없는 경우
+   * 권한 없는 예약에 접근하는 경우
    * @author 김예진
-   * @since 2025-12-09
+   * @since 2025-12-12
    */
+  @Test
+  @DisplayName("예약 접근 권한이 없다면, UnauthorizedReservationAccessException 발생해야 한다.")
+  void cancelReservationByUser_UnauthorizedAccess() {
+    // give
+    // 예약자, 미예약자 아이디 생성
+    long reservationUserId = 1L; // 예약자 ID
+    long nonReservationUserId = 20L; // 미예약자 ID
+
+    //  1. 예약 조회
+    //  reservationRepository.findById() 실행 시 mock 객체 reservation 반환하도록 설정
+    BDDMockito.given(reservationRepository.findById(anyLong())).willReturn(Optional.of(reservation));
+    // 2. 본인의 예약인지 검증
+    // reservation.getUserId() 실행 시 예약자 id인 reservationUserId 반환하도록 설정
+    BDDMockito.given(reservation.getUserId()).willReturn(reservationUserId);
+
+    // when
+    // cancelReservationByUser() 메서드의 매개변수로 예약자 ID에 reservationUserId, 현재 유저 ID에 nonReservationUserId를 전달했을 때
+    // 즉, 실제 예약자와 현재 접근자가 다를 때 UnauthorizedReservationAccessException 이 발생하는지
+    UnauthorizedReservationAccessException exception = assertThrows(
+        UnauthorizedReservationAccessException.class, () -> reservationService.cancelReservationByUser(reservationUserId,
+            nonReservationUserId));
+
+    // then
+    // exception 내용 검증
+    assertThat(exception.getMessage()).isEqualTo("해당 예약을 처리할 권한이 없거나, 접근할 수 없는 예약입니다.");
+
+  }
+
+
+    /**
+     * 예약 데이터가 없는 경우
+     * @author 김예진
+     * @since 2025-12-09
+     */
   @Test
   @DisplayName("예약을 찾을 수 없다면, ReservationNotFoundException 발생시킨다.")
   void cancelReservationByUser_NotFound(){
