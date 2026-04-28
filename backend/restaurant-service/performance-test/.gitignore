@@ -1,0 +1,22 @@
+# JMeter 자동 생성 HTML 리포트 (vendor 파일 수백개 포함)
+results/html-report/
+results/remote-after-report/
+results/remote-before-report/
+
+# 중간 테스트 결과 (최종본 아님)
+results/remote-after.jtl
+
+# JMeter 로그
+jmeter.log
+
+# 민감 정보 포함 문서 (DB 접속 정보, Oracle Cloud VM IP 등)
+SESSION-SUMMARY.md
+HANDOFF-ORACLE.md
+
+# 개인 참고용 문서
+PORTFOLIO-GUIDE.md
+README.md
+RESULTS.md
+
+# Oracle Cloud 설정 문서
+Oracle_Cloud_설정_완료보고서.docx

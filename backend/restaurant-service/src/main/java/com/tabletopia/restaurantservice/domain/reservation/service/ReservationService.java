@@ -14,19 +14,26 @@ import com.tabletopia.restaurantservice.domain.reservation.dto.UpdateReservation
 import com.tabletopia.restaurantservice.domain.reservation.entity.Reservation;
 import com.tabletopia.restaurantservice.domain.reservation.enums.ReservationStatus;
 import com.tabletopia.restaurantservice.domain.reservation.enums.TableSelectStatus;
+import com.tabletopia.restaurantservice.domain.reservation.exception.InvalidReservationStatusException;
+import com.tabletopia.restaurantservice.domain.reservation.exception.ReservationNotFoundException;
+import com.tabletopia.restaurantservice.domain.reservation.exception.TableSelectionNotFoundException;
+import com.tabletopia.restaurantservice.domain.reservation.exception.UnauthorizedReservationAccessException;
 import com.tabletopia.restaurantservice.domain.reservation.repository.ReservationRepository;
 import com.tabletopia.restaurantservice.domain.restaurantOpeningHour.dto.RestaurantEffectiveHourResponse;
 import com.tabletopia.restaurantservice.domain.restaurantOpeningHour.service.RestaurantOpeningHourService;
 import com.tabletopia.restaurantservice.domain.restaurantTable.entity.RestaurantTable;
 import com.tabletopia.restaurantservice.domain.restaurantTable.service.RestaurantTableService;
 import com.tabletopia.restaurantservice.domain.user.service.UserService;
+import com.tabletopia.restaurantservice.util.PerformanceMonitor;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import org.springframework.data.redis.core.RedisTemplate;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
@@ -49,8 +56,13 @@ public class ReservationService {
   private final TableSelectionService tableSelectionService;
   private final UserService userService;
   private final RestaurantOpeningHourService openingHourService;
+  private final PerformanceMonitor performanceMonitor;
+  private final RedisTemplate<String, Object> redisTemplate;
 
   private final SimpMessagingTemplate messagingTemplate;
+
+  private static final String TIMESLOT_CACHE_PREFIX = "timeslots:cache:";
+  private static final long TIMESLOT_CACHE_TTL = 5; // 5분
 
   /**
    * 예약 등록 (검증 포함)
@@ -58,7 +70,6 @@ public class ReservationService {
    * @param request            예약 요청 정보
    * @param authenticatedEmail JWT에서 추출한 인증된 사용자 이메일
    * @return 생성된 예약 ID
-   * @throws IllegalStateException 검증 실패 시
    * @author 김예진
    * @since 2025-10-16
    */
@@ -112,35 +123,41 @@ public class ReservationService {
   /**
    * 예약 검증 로직
    *
-   * @param selection          Redis 선점 정보
+   * @param selection Redis 선점 정보
    * @param authenticatedEmail JWT에서 추출한 인증된 이메일
-   * @throws IllegalStateException 검증 실패 시
+   * @throws TableSelectionNotFoundException 테이블 선점 정보를 찾을 수 없을 때
+   * @throws InvalidReservationStatusException 예약이 유효하지 않은 상태일 때
+   * @throws UnauthorizedReservationAccessException 예약 상태를 변경할 권한이 없을 때
    * @author 김예진
    * @since 2025-10-16
    */
   private void validateReservation(TableSelectionInfo selection, String authenticatedEmail) {
-    // Redis에 선점 정보가 없음
+    // Redis에 선점 정보가 없는 경우
     if (selection == null) {
       log.warn("선점 정보 없음: 인증 이메일={}", authenticatedEmail);
-      throw new IllegalStateException("선점되지 않은 테이블입니다. 테이블을 먼저 선택해주세요.");
+      // 데이터 없음 예외 발생
+      throw new TableSelectionNotFoundException();
     }
 
-    // 선점 만료됨
+    // 선점 시간이 만료되었을 경우
     if (tableSelectionService.isSelectionExpired(selection)) {
-      log.warn("선점 시간 만료: 만료시간={}, 현재시간={}", selection.getExpiryTime(), LocalDateTime.now());
-      throw new IllegalStateException("선점 시간이 만료되었습니다. 테이블을 다시 선택해주세요.");
+      log.warn("선점 시간 만료: 만료 시간={}, 현재 시간={}", selection.getExpiryTime(), LocalDateTime.now());
+      // 유효하지 않은 상태 예외 발생
+      throw new InvalidReservationStatusException("선점 시간이 만료되었습니다. 테이블을 다시 선택해주세요.");
     }
 
-    // 선점자와 예약자가 다름 (보안 체크)
+    // 선점자와 예약자가 다른 경우 (보안 체크)
     if (!selection.getEmail().equals(authenticatedEmail)) {
       log.warn("선점자 불일치: 선점자={}, 요청자={}", selection.getEmail(), authenticatedEmail);
-      throw new IllegalStateException("본인이 선점한 테이블만 예약할 수 있습니다.");
+      // 권한 없음 예외 발생
+      throw new UnauthorizedReservationAccessException("본인이 선점한 테이블만 예약할 수 있습니다.");
     }
 
-    // 이미 예약 완료 상태
+    // 이미 예약 완료 상태인 경우
     if (selection.getStatus() == TableSelectStatus.RESERVED) {
       log.warn("이미 예약 완료됨: 테이블ID={}", selection.getTableId());
-      throw new IllegalStateException("이미 예약된 테이블입니다.");
+      // 유효하지 않은 상태 예외 발생
+      throw new InvalidReservationStatusException("이미 예약된 테이블입니다.");
     }
 
     log.debug("예약 검증 통과: 이메일={}, 테이블ID={}", authenticatedEmail, selection.getTableId());
@@ -209,8 +226,6 @@ public class ReservationService {
     // 요청에서 예약자 정보 꺼내기
     CustomerInfo reservationCustomerInfo = request.getCustomerInfo();
 
-    RestaurantSnapshot restaurantSnapshot = new RestaurantSnapshot(1L, request.getRestaurantName(), request.getRestaurantAddress(),
-        request.getRestaurantPhone());
     TableSnapshot tableSnapshot = new TableSnapshot(request.getRestaurantTableNameSnapshot(), request.getPeopleCount());
 
 // 사용자 ID 조회
@@ -230,8 +245,8 @@ public class ReservationService {
   /**
    * 결제 완료 후 예약 등록 (Payment 포함)
    *
-   * @param request             예약 요청 정보
-   * @param payment            결제 정보
+   * @param request 예약 요청 정보
+   * @param payment 결제 정보
    * @param authenticatedEmail 인증된 이메일
    * @return 생성된 예약 ID
    * @author 김예진
@@ -407,12 +422,31 @@ public class ReservationService {
    * 특정 날짜의 타임슬롯별 예약 가능 여부 조회 각 타임슬롯마다 예약 가능한 테이블이 1개라도 있으면 예약 가능으로 프론트엔드에서 표시하기 위한 메서드
    *
    * @param restaurantId 레스토랑 아이디
-   * @param date         조회날짜
+   * @param date 조회날짜
    * @return 타임슬롯별 예약 가능 여부
    * @author 김예진
    * @since 2025-10-17
    */
   public TimeSlotAvailabilityResponse getAvailableTimeSlots(Long restaurantId, LocalDate date) {
+    String cacheKey = TIMESLOT_CACHE_PREFIX + restaurantId + ":" + date;
+
+    // Redis 캐시 조회
+    long cacheStart = System.nanoTime();
+    try {
+      Object cached = redisTemplate.opsForValue().get(cacheKey);
+      if (cached instanceof TimeSlotAvailabilityResponse response) {
+        double cacheTimeMs = (System.nanoTime() - cacheStart) / 1_000_000.0;
+        performanceMonitor.logCachePerformance("타임슬롯조회", true, cacheTimeMs);
+        return response;
+      }
+    } catch (Exception e) {
+      log.warn("타임슬롯 캐시 조회 실패, DB로 폴백: {}", e.getMessage());
+    }
+    double cacheMissMs = (System.nanoTime() - cacheStart) / 1_000_000.0;
+    performanceMonitor.logCachePerformance("타임슬롯조회", false, cacheMissMs);
+
+    long startTime = System.nanoTime();
+
     // 운영시간 조회
     RestaurantEffectiveHourResponse effectiveHour = openingHourService.getEffectiveHour(restaurantId, date);
 
@@ -439,12 +473,17 @@ public class ReservationService {
           // date(LocalDate)와 timeSlot(LocalTime)을 넣어서 reservationDateTime(LocalDateTime)으로 포맷팅
           LocalDateTime reservationDateTime = LocalDateTime.of(date, timeSlot);
 
+          long dbQueryStart = System.nanoTime();
           // 해당 일시에 예약된 테이블 id 목록
           List<Long> reservedTablesIds = reservationRepository
               .findReservationsByRestaurantIdAndReservationAt(restaurantId, reservationDateTime)
               .stream()
               .map(Reservation::getRestaurantTableId)
               .toList();
+          long dbQueryEnd = System.nanoTime();
+          double dbQueryTimeMs = (dbQueryEnd - dbQueryStart) / 1_000_000.0;
+
+//          log.debug("[성능측정] DB 예약조회[timeSlot={}] - 소요시간: {:.2f}ms", timeSlot, dbQueryTimeMs);
 
           // 예약 가능한 테이블 수 계산
           int avaliableTableCount = tables.size() - reservedTablesIds.size();
@@ -457,7 +496,12 @@ public class ReservationService {
               .build();
         }).toList();
 
-    return TimeSlotAvailabilityResponse.builder()
+    long endTime = System.nanoTime();
+    double totalTimeMs = (endTime - startTime) / 1_000_000.0;
+//    log.info("[성능측정] 타임슬롯조회 전체[restaurantId={}, 슬롯수={}] - 소요시간: {:.2f}ms",
+//        restaurantId, timeSlots.size(), totalTimeMs);
+
+    TimeSlotAvailabilityResponse result = TimeSlotAvailabilityResponse.builder()
         .date(date)
         .restaurantId(restaurantId)
         .isOpen(true)
@@ -466,6 +510,15 @@ public class ReservationService {
         .timeSlots(timeSlotInfoList)
         .reservationInterval(effectiveHour.getReservationInterval())
         .build();
+
+    // Redis 캐시 저장
+    try {
+      redisTemplate.opsForValue().set(cacheKey, result, TIMESLOT_CACHE_TTL, TimeUnit.MINUTES);
+    } catch (Exception e) {
+      log.warn("타임슬롯 캐시 저장 실패: {}", e.getMessage());
+    }
+
+    return result;
   }
 
   /**
@@ -498,9 +551,12 @@ public class ReservationService {
   /**
    * 예약 상태를 변경
    *
-   * @param restaurantId
-   * @param reservationId
-   * @param request
+   * @param restaurantId 레스토랑 ID
+   * @param reservationId 예약 ID
+   * @param request 상태 변경 요청 정보
+   * @throws ReservationNotFoundException 해당 ID의 예약을 찾을 수 없는 경우
+   * @throws UnauthorizedReservationAccessException 예약을 변경할 권한이 없는 경우
+   * @author 김예진
    */
   @Transactional
   public void updateReservationStatus(
@@ -509,17 +565,19 @@ public class ReservationService {
       UpdateReservationStatusRequest request) {
     // 1. 예약 조회
     Reservation reservation = reservationRepository.findById(reservationId)
-        .orElseThrow(() -> new IllegalArgumentException("예약을 찾을 수 없습니다"));
+        // 존재하지 않는 예약일 경우 데이터 없음 예외 발생
+        .orElseThrow(ReservationNotFoundException::new);
 
     // 2. 레스토랑 ID 검증
+    // 예약 상태를 변경하고자하는 레스토랑이 알맞은지 확인
     if (!reservation.getRestaurantId().equals(restaurantId)) {
-      throw new IllegalArgumentException("해당 레스토랑의 예약이 아닙니다");
+      // 요청된 레스토랑 ID와 예약 객체의 레스토랑 ID가 불일치하면 권한 없음 예외 발생
+      throw new UnauthorizedReservationAccessException();
     }
 
     // 3. 상태 변경 전 웹소켓 알림용 정보 저장
     Long tableId = reservation.getRestaurantTableId();
     LocalDateTime reservationAt = reservation.getReservationAt();
-    ReservationStatus oldStatus = reservation.getReservationState();
 
     // 4. 상태 변경
     String status = request.getStatus();
@@ -545,7 +603,7 @@ public class ReservationService {
         break;
 
       default:
-        throw new IllegalArgumentException("유효하지 않은 상태입니다: " + status);
+        throw new InvalidReservationStatusException();
     }
 
     // 5. 저장 (JPA dirty checking으로 자동 저장되지만 명시적으로 호출 가능)
@@ -598,8 +656,14 @@ public class ReservationService {
   }
 
   /**
-   * 사용자가 자신의 예약 취소
-   *
+   * 사용자가 자신의 예약을 취소
+   * <p>
+   * 1. 예약 존재 여부 검증
+   * 2. 본인 예약 여부(권한) 검증
+   * 3. 취소 가능 상태(PENDING, CONFIRMED) 검증
+   * 4. DB 예약 상태 변경 (-> CANCELLED)
+   * 5. Redis 타임슬롯 선점 캐시 무효화 (다른 사용자가 예약 가능하도록 처리)
+   * 6. WebSocket을 통해 실시간으로 테이블 상태 변경 알림 전송 (AVAILABLE)
    * @param reservationId 예약 ID
    * @param userId 사용자 ID
    * @author 김예진
@@ -609,17 +673,19 @@ public class ReservationService {
   public void cancelReservationByUser(Long reservationId, Long userId) {
     // 1. 예약 조회
     Reservation reservation = reservationRepository.findById(reservationId)
-        .orElseThrow(() -> new IllegalArgumentException("예약을 찾을 수 없습니다"));
+        // 조회되지 않을 경우 데이터 없음 예외
+        .orElseThrow(ReservationNotFoundException::new);
 
     // 2. 본인의 예약인지 검증
     if (!reservation.getUserId().equals(userId)) {
-      throw new IllegalArgumentException("본인의 예약만 취소할 수 있습니다");
+      // 아닐 경우 권한 없음 예외
+      throw new UnauthorizedReservationAccessException();
     }
 
     // 3. 취소 가능한 상태인지 검증 (PENDING 또는 CONFIRMED만 취소 가능)
     if (reservation.getReservationState() != ReservationStatus.PENDING &&
         reservation.getReservationState() != ReservationStatus.CONFIRMED) {
-      throw new IllegalStateException("취소할 수 없는 예약 상태입니다: " + reservation.getReservationState());
+      throw new InvalidReservationStatusException("취소할 수 없는 예약 상태입니다.");
     }
 
     // 4. 상태 변경 전 웹소켓 알림용 정보 저장
