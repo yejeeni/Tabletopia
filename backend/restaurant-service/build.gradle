@@ -111,3 +111,7 @@ dependencyManagement {
 tasks.named('test', Test) {
     useJUnitPlatform()
 }
+
+bootRun {
+    jvmArgs = ['-Dfile.encoding=UTF-8', '-Dstdout.encoding=UTF-8']
+}

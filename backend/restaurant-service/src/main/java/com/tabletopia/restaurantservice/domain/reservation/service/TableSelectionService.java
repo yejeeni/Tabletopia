@@ -1,6 +1,7 @@
 package com.tabletopia.restaurantservice.domain.reservation.service;
 
 import com.tabletopia.restaurantservice.domain.reservation.dto.TableSelectionInfo;
+import com.tabletopia.restaurantservice.util.PerformanceMonitor;
 
 import java.time.LocalDateTime;
 import java.util.Set;
@@ -23,6 +24,7 @@ import org.springframework.stereotype.Service;
 public class TableSelectionService {
 
   private final RedisTemplate<String, Object> redisTemplate;
+  private final PerformanceMonitor performanceMonitor;
 
   // Redis Key 접두사
   private static final String TABLE_SELECTION_PREFIX = "table:selection:";
@@ -110,19 +112,26 @@ public class TableSelectionService {
     String redisKey = TABLE_SELECTION_PREFIX + selectionKey;
     log.debug("선점조회 시작");
 
+    long startTime = System.nanoTime();
     try {
       Object value = redisTemplate.opsForValue().get(redisKey);
+      long endTime = System.nanoTime();
+      double elapsedTimeMs = (endTime - startTime) / 1_000_000.0;
 
       if (value instanceof TableSelectionInfo) {
         TableSelectionInfo info = (TableSelectionInfo) value;
+//        log.info("[성능측정] Redis 테이블선점조회 - 소요시간: {:.2f}ms", elapsedTimeMs);
         log.debug("Redis 조회: {} -> {}", redisKey, info);
         return info;
       }
 
+//      log.info("[성능측정] Redis 테이블선점조회(데이터없음) - 소요시간: {:.2f}ms", elapsedTimeMs);
       log.debug("Redis 조회: {} -> null", redisKey);
       return null;
     } catch (Exception e) {
-      log.error("Redis 조회 실패: {}", redisKey, e);
+      long endTime = System.nanoTime();
+      double elapsedTimeMs = (endTime - startTime) / 1_000_000.0;
+      log.error("Redis 조회 실패: {} - 소요시간: {:.2f}ms", redisKey, elapsedTimeMs, e);
       return null;
     }
   }
@@ -267,18 +276,33 @@ public class TableSelectionService {
   public Boolean getCachedReservationStatus(Long restaurantId, Long tableId, String timeSlot) {
     String redisKey = String.format("%s%d:%d:%s", RESERVATION_CACHE_PREFIX, restaurantId, tableId, timeSlot);
 
+    long startTime = System.nanoTime();
     try {
       Object value = redisTemplate.opsForValue().get(redisKey);
+      long endTime = System.nanoTime();
+      double elapsedTimeMs = (endTime - startTime) / 1_000_000.0;
 
       if (value instanceof Boolean) {
+        performanceMonitor.logCachePerformance(
+            String.format("예약캐시조회[restaurantId=%d, tableId=%d]", restaurantId, tableId),
+            true,
+            elapsedTimeMs
+        );
         log.debug("예약 캐시 조회 (캐시 히트): {} -> {}", redisKey, value);
         return (Boolean) value;
       }
 
+      performanceMonitor.logCachePerformance(
+          String.format("예약캐시조회[restaurantId=%d, tableId=%d]", restaurantId, tableId),
+          false,
+          elapsedTimeMs
+      );
       log.debug("예약 캐시 조회 (캐시 미스): {}", redisKey);
       return null; // 캐시 없음
     } catch (Exception e) {
-      log.error("예약 캐시 조회 실패: {}", redisKey, e);
+      long endTime = System.nanoTime();
+      double elapsedTimeMs = (endTime - startTime) / 1_000_000.0;
+      log.error("예약 캐시 조회 실패: {} - 소요시간: {:.2f}ms", redisKey, elapsedTimeMs, e);
       return null;
     }
   }

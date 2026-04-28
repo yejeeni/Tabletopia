@@ -24,13 +24,16 @@ import com.tabletopia.restaurantservice.domain.restaurantOpeningHour.service.Res
 import com.tabletopia.restaurantservice.domain.restaurantTable.entity.RestaurantTable;
 import com.tabletopia.restaurantservice.domain.restaurantTable.service.RestaurantTableService;
 import com.tabletopia.restaurantservice.domain.user.service.UserService;
+import com.tabletopia.restaurantservice.util.PerformanceMonitor;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import org.springframework.data.redis.core.RedisTemplate;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
@@ -53,8 +56,13 @@ public class ReservationService {
   private final TableSelectionService tableSelectionService;
   private final UserService userService;
   private final RestaurantOpeningHourService openingHourService;
+  private final PerformanceMonitor performanceMonitor;
+  private final RedisTemplate<String, Object> redisTemplate;
 
   private final SimpMessagingTemplate messagingTemplate;
+
+  private static final String TIMESLOT_CACHE_PREFIX = "timeslots:cache:";
+  private static final long TIMESLOT_CACHE_TTL = 5; // 5분
 
   /**
    * 예약 등록 (검증 포함)
@@ -414,12 +422,31 @@ public class ReservationService {
    * 특정 날짜의 타임슬롯별 예약 가능 여부 조회 각 타임슬롯마다 예약 가능한 테이블이 1개라도 있으면 예약 가능으로 프론트엔드에서 표시하기 위한 메서드
    *
    * @param restaurantId 레스토랑 아이디
-   * @param date         조회날짜
+   * @param date 조회날짜
    * @return 타임슬롯별 예약 가능 여부
    * @author 김예진
    * @since 2025-10-17
    */
   public TimeSlotAvailabilityResponse getAvailableTimeSlots(Long restaurantId, LocalDate date) {
+    String cacheKey = TIMESLOT_CACHE_PREFIX + restaurantId + ":" + date;
+
+    // Redis 캐시 조회
+    long cacheStart = System.nanoTime();
+    try {
+      Object cached = redisTemplate.opsForValue().get(cacheKey);
+      if (cached instanceof TimeSlotAvailabilityResponse response) {
+        double cacheTimeMs = (System.nanoTime() - cacheStart) / 1_000_000.0;
+        performanceMonitor.logCachePerformance("타임슬롯조회", true, cacheTimeMs);
+        return response;
+      }
+    } catch (Exception e) {
+      log.warn("타임슬롯 캐시 조회 실패, DB로 폴백: {}", e.getMessage());
+    }
+    double cacheMissMs = (System.nanoTime() - cacheStart) / 1_000_000.0;
+    performanceMonitor.logCachePerformance("타임슬롯조회", false, cacheMissMs);
+
+    long startTime = System.nanoTime();
+
     // 운영시간 조회
     RestaurantEffectiveHourResponse effectiveHour = openingHourService.getEffectiveHour(restaurantId, date);
 
@@ -446,12 +473,17 @@ public class ReservationService {
           // date(LocalDate)와 timeSlot(LocalTime)을 넣어서 reservationDateTime(LocalDateTime)으로 포맷팅
           LocalDateTime reservationDateTime = LocalDateTime.of(date, timeSlot);
 
+          long dbQueryStart = System.nanoTime();
           // 해당 일시에 예약된 테이블 id 목록
           List<Long> reservedTablesIds = reservationRepository
               .findReservationsByRestaurantIdAndReservationAt(restaurantId, reservationDateTime)
               .stream()
               .map(Reservation::getRestaurantTableId)
               .toList();
+          long dbQueryEnd = System.nanoTime();
+          double dbQueryTimeMs = (dbQueryEnd - dbQueryStart) / 1_000_000.0;
+
+//          log.debug("[성능측정] DB 예약조회[timeSlot={}] - 소요시간: {:.2f}ms", timeSlot, dbQueryTimeMs);
 
           // 예약 가능한 테이블 수 계산
           int avaliableTableCount = tables.size() - reservedTablesIds.size();
@@ -464,7 +496,12 @@ public class ReservationService {
               .build();
         }).toList();
 
-    return TimeSlotAvailabilityResponse.builder()
+    long endTime = System.nanoTime();
+    double totalTimeMs = (endTime - startTime) / 1_000_000.0;
+//    log.info("[성능측정] 타임슬롯조회 전체[restaurantId={}, 슬롯수={}] - 소요시간: {:.2f}ms",
+//        restaurantId, timeSlots.size(), totalTimeMs);
+
+    TimeSlotAvailabilityResponse result = TimeSlotAvailabilityResponse.builder()
         .date(date)
         .restaurantId(restaurantId)
         .isOpen(true)
@@ -473,6 +510,15 @@ public class ReservationService {
         .timeSlots(timeSlotInfoList)
         .reservationInterval(effectiveHour.getReservationInterval())
         .build();
+
+    // Redis 캐시 저장
+    try {
+      redisTemplate.opsForValue().set(cacheKey, result, TIMESLOT_CACHE_TTL, TimeUnit.MINUTES);
+    } catch (Exception e) {
+      log.warn("타임슬롯 캐시 저장 실패: {}", e.getMessage());
+    }
+
+    return result;
   }
 
   /**
